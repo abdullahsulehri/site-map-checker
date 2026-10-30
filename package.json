@@ -1,0 +1,14 @@
+{
+  "name": "site-mapper-checker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build-config": "node build_config.js",
+    "check": "node check.js",
+    "test": "node test/run_tests.js"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "playwright": "^1.62.1"
+  }
+}

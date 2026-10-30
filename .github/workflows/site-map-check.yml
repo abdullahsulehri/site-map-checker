@@ -1,0 +1,156 @@
+name: Site map check
+
+# Started by the Google Form (see apps_script/Code.gs) or manually from the
+# Actions tab. All inputs go through env vars, never pasted into shell commands,
+# because they come from a form and must be treated as untrusted text.
+on:
+  workflow_dispatch:
+    inputs:
+      site_name:
+        description: Site name (used in the report)
+        required: true
+      site_url:
+        description: Homepage URL (used to find the sitemap if none is given)
+        required: false
+      sitemap_url:
+        description: Direct sitemap URL (optional)
+        required: false
+      page_list:
+        description: Pasted page URLs, one per line (optional, overrides sitemaps)
+        required: false
+      recipient_email:
+        description: Where to email the report
+        required: true
+      max_pages:
+        description: Max pages to check. Default 200. Raise it for bigger sites (hard limit 1000)
+        required: false
+        default: '200'
+      estimate_only:
+        description: Only count pages/links and estimate the run time; do not crawl
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - name: Record start time
+        run: echo "RUN_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      # Runs first so an estimate-only run (or a refused oversized run) never pays for the browser install.
+      - name: Build config from sitemap
+        env:
+          SITE_NAME: ${{ inputs.site_name }}
+          SITE_URL: ${{ inputs.site_url }}
+          SITEMAP_URL: ${{ inputs.sitemap_url }}
+          PAGE_LIST: ${{ inputs.page_list }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+          MAX_PAGES_CEILING: '1000'
+          MAX_RUNTIME_MIN: '300'
+        run: |
+          case "$MAX_PAGES" in ''|*[!0-9]*) MAX_PAGES=200 ;; esac
+          export MAX_PAGES
+          node build_config.js
+
+      - name: Install Playwright browsers
+        if: ${{ inputs.estimate_only != true }}
+        run: npx playwright install --with-deps chromium
+
+      - name: Run site check
+        if: ${{ inputs.estimate_only != true }}
+        run: node check.js
+
+      - name: Add report summary to run overview
+        if: always()
+        run: |
+          if [ -f summary.md ]; then cat summary.md >> "$GITHUB_STEP_SUMMARY"; elif [ -f build_summary.json ]; then echo '```json' >> "$GITHUB_STEP_SUMMARY"; cat build_summary.json >> "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"; else echo "No report produced." >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Export report name for a unique artifact zip
+        if: always()
+        run: |
+          FNAME=$(ls Website_Health_Report_*.xlsx 2>/dev/null | head -n1)
+          if [ -n "$FNAME" ]; then echo "REPORT_BASENAME=${FNAME%.xlsx}" >> "$GITHUB_ENV"; else echo "REPORT_BASENAME=no-report-$(date +%s)" >> "$GITHUB_ENV"; fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-check-report-${{ env.REPORT_BASENAME }}
+          path: |
+            report.json
+            summary.md
+            build_summary.json
+            run_stats.json
+            Website_Health_Report_*.xlsx
+
+      - name: Email the report (Google Apps Script mailer)
+        if: always()
+        env:
+          MAIL_WEBHOOK_URL: ${{ secrets.MAIL_WEBHOOK_URL }}
+          MAIL_SECRET: ${{ secrets.MAIL_SECRET }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOB_STATUS: ${{ job.status }}
+          SITE_NAME: ${{ inputs.site_name }}
+          RECIPIENT: ${{ inputs.recipient_email }}
+          ESTIMATE_ONLY: ${{ inputs.estimate_only }}
+        run: |
+          if [ -z "$MAIL_WEBHOOK_URL" ] || [ -z "$MAIL_SECRET" ]; then echo "MAIL_WEBHOOK_URL / MAIL_SECRET not set, skipping email"; exit 0; fi
+          ELAPSED_MIN=$(( ( $(date +%s) - RUN_START_EPOCH + 59 ) / 60 ))
+          B=build_summary.json; S=run_stats.json
+          bj() { jq -r "($1) // \"n/a\"" "$B" 2>/dev/null; }
+          sj() { jq -r "($1) // \"n/a\"" "$S" 2>/dev/null; }
+
+          # ---- what the numbers say ----
+          if [ -f "$S" ]; then
+            LINKS="Links: $(sj .link_sightings) found on pages, $(sj .unique_links) unique ($(sj .unique_internal) internal, $(sj .unique_external) external)."
+          elif [ -f "$B" ]; then
+            LINKS="Links (counted from page HTML, JavaScript-added links not included): about $(bj .est_link_sightings) found, $(bj .est_unique_links) unique ($(bj .est_unique_internal) internal, $(bj .est_unique_external) external)."
+          else LINKS=""; fi
+          if [ -f "$B" ]; then
+            PAGES="Pages: $(bj .found) in the sitemap, $(bj .checked) checked (cap $(bj .cap), skipped by cap: $(bj .skipped_by_cap)); $(bj .low_confidence_pages) with low-confidence page types."
+            if [ -f "$S" ]; then WHEN="Actual run time"; else WHEN="Time elapsed"; fi
+            TIME="Estimated run time: ~$(bj .est_minutes) min (range $(bj .est_minutes_low)-$(bj .est_minutes_high)). ${WHEN}: ~${ELAPSED_MIN} min."
+            HINT="$(jq -r '.hint // empty' "$B" 2>/dev/null)"
+            SRC="Source: $(bj .source)"
+          else PAGES=""; TIME="Time elapsed: ~${ELAPSED_MIN} min."; HINT=""; SRC=""; fi
+          COVERAGE=$(printf '%s\n%s\n%s\n%s\n%s' "$PAGES" "$LINKS" "$TIME" "$HINT" "$SRC" | sed '/^$/d')
+
+          # ---- headline ----
+          if [ "$ESTIMATE_ONLY" = "true" ] && [ -f "$B" ]; then
+            HEADLINE="ESTIMATE ONLY (nothing was crawled): $(bj .checked) pages, ~$(bj .est_unique_links) unique links, about $(bj .est_minutes) min. Submit again without 'estimate only' to run it."
+            JOB_STATUS="estimate"
+          elif [ -f summary.md ]; then
+            HEADLINE=$(sed -n '3p' summary.md)
+          elif [ -f "$B" ] && [ -n "$(jq -r '.message // empty' "$B" 2>/dev/null)" ]; then
+            HEADLINE="$(jq -r '.message' "$B")"
+          else
+            HEADLINE="Run did not produce a report (see run link). Common cause: no sitemap found."
+          fi
+
+          ISSUES=$(awk '/^### /{h=$0; shown=0; next} /^## Broken links/{print "\n" $0; b=1; next} /^- \[/ && (b || h ~ /ISSUES FOUND/) {if(!b && !shown){print "\n" h; shown=1} print}' summary.md 2>/dev/null | head -c 6000)
+          XLSX=$(ls Website_Health_Report_*.xlsx 2>/dev/null | head -n1)
+          SUBJECT="Site check (${SITE_NAME}): ${JOB_STATUS} - $(printf '%s' "$HEADLINE" | tr -d '*' | cut -c1-120)"
+          BODY=$(printf '%s\n\n%s\n\nRun: %s\n\n%s\n' "$(printf '%s' "$HEADLINE" | tr -d '*')" "$COVERAGE" "$RUN_URL" "$ISSUES")
+          if [ -n "$XLSX" ]; then
+            jq -n --arg secret "$MAIL_SECRET" --arg to "$RECIPIENT" --arg subject "$SUBJECT" --arg body "$BODY" \
+               --arg filename "$XLSX" --rawfile b64 <(base64 -w0 "$XLSX") \
+               '{secret:$secret,to:$to,subject:$subject,body:$body,filename:$filename,report_b64:$b64}' > mail_payload.json
+          else
+            jq -n --arg secret "$MAIL_SECRET" --arg to "$RECIPIENT" --arg subject "$SUBJECT" --arg body "$BODY" \
+               '{secret:$secret,to:$to,subject:$subject,body:$body}' > mail_payload.json
+          fi
+          # -L: Apps Script answers a POST with a redirect to the result.
+          RESP=$(curl -sS -L -H 'Content-Type: application/json' --data-binary @mail_payload.json "$MAIL_WEBHOOK_URL")
+          echo "Mailer response: $RESP"
+          echo "$RESP" | jq -e '.ok == true' > /dev/null

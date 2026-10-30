@@ -1,0 +1,6 @@
+node_modules/
+config.json
+build_summary.json
+report.json
+summary.md
+Website_Health_Report_*.xlsx
