@@ -7,6 +7,7 @@
 //   SITE_URL      homepage, e.g. https://example.com (used to auto-find the sitemap)
 //   SITEMAP_URL   direct link to sitemap.xml / sitemap index (optional)
 //   PAGE_LIST     newline- or comma-separated URLs (optional, overrides sitemaps)
+//   INPUT_FILE_URL  link to an uploaded sitemap.xml or a text/CSV list of URLs (optional)
 //   MAX_PAGES     cap on pages checked (default 200)
 //   NO_FETCH=1    skip loading pages for titles/signals (used by tests)
 //
@@ -216,9 +217,24 @@ async function main() {
   let raw = []; // [{url, hint}]
   let source;
 
-  if (list.length) {
-    raw = list.map((u) => ({ url: u, hint: '' }));
-    source = 'pasted page list';
+  let fileText = '';
+  if (process.env.INPUT_FILE_URL) {
+    try { fileText = await fetchText(process.env.INPUT_FILE_URL, 30000); }
+    catch (e) { console.error('Could not read the uploaded file: ' + e.message); process.exit(2); }
+  }
+
+  if (fileText && /<(urlset|sitemapindex)/i.test(fileText)) {
+    // Uploaded sitemap XML (or a sitemap index: follow its children).
+    if (/<sitemapindex/i.test(fileText)) {
+      for (const child of locs(fileText)) raw.push(...await collectSitemap(child, 1, state));
+    } else {
+      raw = locs(fileText).map((u) => ({ url: u, hint: '' }));
+    }
+    source = 'uploaded sitemap file';
+  } else if (fileText || list.length) {
+    const fromFile = fileText.split(/[\s,;]+/).filter((u) => /^https?:\/\//i.test(u));
+    raw = [...fromFile, ...list].map((u) => ({ url: u, hint: '' }));
+    source = fileText ? 'uploaded page list' : 'pasted page list';
   } else {
     let sitemaps = process.env.SITEMAP_URL ? [process.env.SITEMAP_URL] : [];
     if (!sitemaps.length && siteUrl) sitemaps = await discoverSitemaps(siteUrl);
