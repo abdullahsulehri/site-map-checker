@@ -1,4 +1,5 @@
 name: Site map check
+run-name: Site check ${{ inputs.site_name }} ${{ inputs.job_id }}
 
 # Started by the Google Form (see apps_script/Code.gs) or manually from the
 # Actions tab. All inputs go through env vars, never pasted into shell commands,
@@ -19,8 +20,14 @@ on:
         description: Pasted page URLs, one per line (optional, overrides sitemaps)
         required: false
       recipient_email:
-        description: Where to email the report
-        required: true
+        description: Where to email the report (optional; leave blank to skip email)
+        required: false
+      job_id:
+        description: Job ID from the web UI (optional; lets the run report back to it)
+        required: false
+      input_file_url:
+        description: Link to an uploaded sitemap.xml or URL list (optional; set by the web UI)
+        required: false
       max_pages:
         description: Max pages to check. Default 200. Raise it for bigger sites (hard limit 1000)
         required: false
@@ -55,6 +62,7 @@ jobs:
           SITE_URL: ${{ inputs.site_url }}
           SITEMAP_URL: ${{ inputs.sitemap_url }}
           PAGE_LIST: ${{ inputs.page_list }}
+          INPUT_FILE_URL: ${{ inputs.input_file_url }}
           MAX_PAGES: ${{ inputs.max_pages }}
           MAX_PAGES_CEILING: '1000'
           MAX_RUNTIME_MIN: '300'
@@ -94,24 +102,18 @@ jobs:
             run_stats.json
             Website_Health_Report_*.xlsx
 
-      - name: Email the report (Google Apps Script mailer)
+      - name: Compose report text
         if: always()
         env:
-          MAIL_WEBHOOK_URL: ${{ secrets.MAIL_WEBHOOK_URL }}
-          MAIL_SECRET: ${{ secrets.MAIL_SECRET }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           JOB_STATUS: ${{ job.status }}
-          SITE_NAME: ${{ inputs.site_name }}
-          RECIPIENT: ${{ inputs.recipient_email }}
           ESTIMATE_ONLY: ${{ inputs.estimate_only }}
         run: |
-          if [ -z "$MAIL_WEBHOOK_URL" ] || [ -z "$MAIL_SECRET" ]; then echo "MAIL_WEBHOOK_URL / MAIL_SECRET not set, skipping email"; exit 0; fi
           ELAPSED_MIN=$(( ( $(date +%s) - RUN_START_EPOCH + 59 ) / 60 ))
           B=build_summary.json; S=run_stats.json
           bj() { jq -r "($1) // \"n/a\"" "$B" 2>/dev/null; }
           sj() { jq -r "($1) // \"n/a\"" "$S" 2>/dev/null; }
 
-          # ---- what the numbers say ----
           if [ -f "$S" ]; then
             LINKS="Links: $(sj .link_sightings) found on pages, $(sj .unique_links) unique ($(sj .unique_internal) internal, $(sj .unique_external) external)."
           elif [ -f "$B" ]; then
@@ -124,12 +126,12 @@ jobs:
             HINT="$(jq -r '.hint // empty' "$B" 2>/dev/null)"
             SRC="Source: $(bj .source)"
           else PAGES=""; TIME="Time elapsed: ~${ELAPSED_MIN} min."; HINT=""; SRC=""; fi
-          COVERAGE=$(printf '%s\n%s\n%s\n%s\n%s' "$PAGES" "$LINKS" "$TIME" "$HINT" "$SRC" | sed '/^$/d')
+          printf '%s\n%s\n%s\n%s\n%s' "$PAGES" "$LINKS" "$TIME" "$HINT" "$SRC" | sed '/^$/d' > _coverage.txt
 
-          # ---- headline ----
+          STATUS="$JOB_STATUS"
           if [ "$ESTIMATE_ONLY" = "true" ] && [ -f "$B" ]; then
             HEADLINE="ESTIMATE ONLY (nothing was crawled): $(bj .checked) pages, ~$(bj .est_unique_links) unique links, about $(bj .est_minutes) min. Submit again without 'estimate only' to run it."
-            JOB_STATUS="estimate"
+            STATUS="estimate"
           elif [ -f summary.md ]; then
             HEADLINE=$(sed -n '3p' summary.md)
           elif [ -f "$B" ] && [ -n "$(jq -r '.message // empty' "$B" 2>/dev/null)" ]; then
@@ -137,11 +139,25 @@ jobs:
           else
             HEADLINE="Run did not produce a report (see run link). Common cause: no sitemap found."
           fi
+          printf '%s' "$(printf '%s' "$HEADLINE" | tr -d '*')" > _headline.txt
+          printf '%s' "$STATUS" > _status.txt
+          awk '/^### /{h=$0; shown=0; next} /^## Broken links/{print "\n" $0; b=1; next} /^- \[/ && (b || h ~ /ISSUES FOUND/) {if(!b && !shown){print "\n" h; shown=1} print}' summary.md 2>/dev/null | head -c 6000 > _issues.txt || true
 
-          ISSUES=$(awk '/^### /{h=$0; shown=0; next} /^## Broken links/{print "\n" $0; b=1; next} /^- \[/ && (b || h ~ /ISSUES FOUND/) {if(!b && !shown){print "\n" h; shown=1} print}' summary.md 2>/dev/null | head -c 6000)
+      - name: Email the report (Google Apps Script mailer)
+        if: always()
+        env:
+          MAIL_WEBHOOK_URL: ${{ secrets.MAIL_WEBHOOK_URL }}
+          MAIL_SECRET: ${{ secrets.MAIL_SECRET }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SITE_NAME: ${{ inputs.site_name }}
+          RECIPIENT: ${{ inputs.recipient_email }}
+        run: |
+          if [ -z "$RECIPIENT" ]; then echo "No recipient given, skipping email"; exit 0; fi
+          if [ -z "$MAIL_WEBHOOK_URL" ] || [ -z "$MAIL_SECRET" ]; then echo "MAIL_WEBHOOK_URL / MAIL_SECRET not set, skipping email"; exit 0; fi
+          HEADLINE=$(cat _headline.txt); STATUS=$(cat _status.txt); COVERAGE=$(cat _coverage.txt); ISSUES=$(cat _issues.txt)
           XLSX=$(ls Website_Health_Report_*.xlsx 2>/dev/null | head -n1)
-          SUBJECT="Site check (${SITE_NAME}): ${JOB_STATUS} - $(printf '%s' "$HEADLINE" | tr -d '*' | cut -c1-120)"
-          BODY=$(printf '%s\n\n%s\n\nRun: %s\n\n%s\n' "$(printf '%s' "$HEADLINE" | tr -d '*')" "$COVERAGE" "$RUN_URL" "$ISSUES")
+          SUBJECT="Site check (${SITE_NAME}): ${STATUS} - $(printf '%s' "$HEADLINE" | cut -c1-120)"
+          BODY=$(printf '%s\n\n%s\n\nRun: %s\n\n%s\n' "$HEADLINE" "$COVERAGE" "$RUN_URL" "$ISSUES")
           if [ -n "$XLSX" ]; then
             jq -n --arg secret "$MAIL_SECRET" --arg to "$RECIPIENT" --arg subject "$SUBJECT" --arg body "$BODY" \
                --arg filename "$XLSX" --rawfile b64 <(base64 -w0 "$XLSX") \
@@ -154,3 +170,34 @@ jobs:
           RESP=$(curl -sS -L -H 'Content-Type: application/json' --data-binary @mail_payload.json "$MAIL_WEBHOOK_URL")
           echo "Mailer response: $RESP"
           echo "$RESP" | jq -e '.ok == true' > /dev/null
+
+      - name: Report back to the web UI (Supabase)
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          JOB_ID: ${{ inputs.job_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$JOB_ID" ]; then echo "No job_id (not started from the UI), skipping"; exit 0; fi
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then echo "SUPABASE_URL / SUPABASE_SERVICE_KEY not set, skipping"; exit 0; fi
+          if ! [[ "$JOB_ID" =~ ^[0-9a-fA-F-]{36}$ ]]; then echo "job_id is not a UUID, refusing"; exit 1; fi
+          AUTH=(-H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY")
+          XLSX=$(ls Website_Health_Report_*.xlsx 2>/dev/null | head -n1)
+          REPORT_PATH=""
+          if [ -n "$XLSX" ]; then
+            REPORT_PATH="$JOB_ID/$XLSX"
+            curl -sS -f -X POST "${AUTH[@]}" -H "x-upsert: true" \
+              -H "Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" \
+              --data-binary @"$XLSX" "$SUPABASE_URL/storage/v1/object/reports/$REPORT_PATH" > /dev/null
+          fi
+          jq -n --arg status "$(cat _status.txt)" --arg headline "$(cat _headline.txt)" --arg coverage "$(cat _coverage.txt)" \
+                --arg issues "$(cat _issues.txt)" --arg run_url "$RUN_URL" --arg report_path "$REPORT_PATH" \
+                --argjson build "$(cat build_summary.json 2>/dev/null || echo null)" \
+                --argjson stats "$(cat run_stats.json 2>/dev/null || echo null)" \
+                '{status:$status,headline:$headline,coverage:$coverage,issues_text:$issues,run_url:$run_url,
+                  report_path:(if $report_path=="" then null else $report_path end),build_summary:$build,run_stats:$stats,
+                  finished_at:(now|todate)}' > ui_payload.json
+          curl -sS -f -X PATCH "${AUTH[@]}" -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+            --data-binary @ui_payload.json "$SUPABASE_URL/rest/v1/jobs?id=eq.$JOB_ID"
+          echo "Reported to UI job $JOB_ID"

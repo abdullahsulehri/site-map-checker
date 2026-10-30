@@ -5,7 +5,7 @@
   "scripts": {
     "build-config": "node build_config.js",
     "check": "node check.js",
-    "test": "node test/run_tests.js"
+    "test": "node test/run_tests.js && node --experimental-strip-types test/validate_test.mjs"
   },
   "dependencies": {
     "exceljs": "^4.4.0",

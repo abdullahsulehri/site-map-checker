@@ -52,6 +52,8 @@ const PAGES = {
 };
 const server = http.createServer((req, res) => {
   const base = `http://127.0.0.1:${server.address().port}`;
+  if (req.url === '/upload-list.txt') return res.end(`${base}/about/\n${base}/contact/, ${base}/about/\nnot a url\n`);
+  if (req.url === '/upload-sitemap.xml') return res.end(`<urlset><url><loc>${base}/about/</loc></url><url><loc>${base}/blog/hello-world/</loc></url></urlset>`);
   if (req.url === '/robots.txt') return res.end(`Sitemap: ${base}/sitemap_index.xml\n`);
   if (req.url === '/sitemap_index.xml') return res.end(`<sitemapindex><sitemap><loc>${base}/page-sitemap.xml</loc></sitemap><sitemap><loc>${base}/post-sitemap.xml</loc></sitemap></sitemapindex>`);
   if (req.url === '/page-sitemap.xml') return res.end(`<urlset>${['/', '/about/', '/contact/', '/mystery-page/', '/odd-article/', '/about/'].map((p) => `<url><loc>${base}${p}</loc></url>`).join('')}<url><loc>https://other-host.com/x</loc></url></urlset>`);
@@ -102,6 +104,13 @@ server.listen(0, '127.0.0.1', async () => {
     assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'build_summary.json'))).blocked, true);
     ({ cfg, sum } = await run({ SITE_URL: '', SITEMAP_URL: '', PAGE_LIST: `http://127.0.0.1:${port}/about/\nhttp://127.0.0.1:${port}/contact/` }));
     assert.strictEqual(cfg.sites[0].pages.length, 2);
+    // uploaded files (used by the UI): a plain URL list and a sitemap XML
+    ({ cfg, sum } = await run({ SITE_URL: '', SITEMAP_URL: '', PAGE_LIST: '', INPUT_FILE_URL: `http://127.0.0.1:${port}/upload-list.txt` }));
+    assert.strictEqual(cfg.sites[0].pages.length, 2, 'URL list upload: dedupes and ignores junk lines');
+    assert.strictEqual(sum.source, 'uploaded page list');
+    ({ cfg, sum } = await run({ SITE_URL: '', SITEMAP_URL: '', PAGE_LIST: '', INPUT_FILE_URL: `http://127.0.0.1:${port}/upload-sitemap.xml` }));
+    assert.strictEqual(cfg.sites[0].pages.length, 2);
+    assert.strictEqual(sum.source, 'uploaded sitemap file');
     console.log('ALL TESTS PASSED');
   } catch (e) { console.error(e); process.exitCode = 1; }
   server.close();
